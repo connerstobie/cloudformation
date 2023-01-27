@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  EnvironmentParam:
+    Description: The Deployment Environment
+    Type: String
+    AllowedValues:
+      - 'npe'
+      - 'prod'
+    Default: 'npe'
+
+Mappings:
+  S3Buckets:
+    npe:
+      Bucket1: "<bucket-name>" # Enter bucket name
+    prod:
+      Bucket1: "<bucket-name>" # Enter bucket name
+
+Resources:
+  AclUpdateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: s3-acl-update.lambda_handler
+      Runtime: python3.8
+      Timeout: 900
+      Policies:
+      - Statement:
+        - Sid: S3ObjectPolicy
+          Effect: Allow
+          Action:
+          - s3:GetObjectAcl
+          - s3:PutObjectAcl
+          Resource:
+            # Add all the buckets you want to update here
+            - !Join [ '', ['arn:aws:s3:::', !FindInMap [S3Buckets, !Ref EnvironmentParam, "Bucket1"], '/*' ] ]
+        - Sid: S3ListPolicy
+          Effect: Allow
+          Action:
+          - s3:List*
+          Resource: '*'
+        - Sid: STSAssumeRole
+          Effect: Allow
+          Action:
+          - sts:AssumeRole
+          Resource: "arn:aws:iam::<Source_account_id:role/<source_account_role>" # Enter ARN specific to your source AWS account
+        - Sid: SSM
+          Effect: Allow
+          Action:
+          - ssm:DescribeParameters
+          - ssm:GetParameterHistory
+          - ssm:DescribeDocumentParameters
+          - ssm:GetParametersByPath
+          - ssm:GetParameters
+          - ssm:GetParameter
+          Resource: !Sub "arn:aws:ssm:us-west-2:${AWS::AccountId}:parameter/${EnvironmentParam}/slack_webhook/aws_alerts/LAMBDA_ALERTS"
+      Environment:
+        Variables: 
+          slackChannel : "<slack_channel>" # Enter Slack channel name you created the webhook for
+          SSM_PARAMETER: !Sub "/${EnvironmentParam}/slack_webhook/aws_alerts/LAMBDA_ALERTS"
+      Events:
+        CloudwatchEvent:
+          Type: CloudWatchEvent
+          Properties:
+              Pattern:
+                source:
+                  - aws.s3
+                detail-type:
+                  - 'AWS API Call via CloudTrail'
+                detail:
+                  eventSource:
+                    - s3.amazonaws.com
+                  eventName:
+                    - PutObject
+                  requestParameters:
+                    bucketName:
+                      # Add all the buckets you want to include in the cloudwatch event here
+                      - !FindInMap [S3Buckets, !Ref EnvironmentParam, "Bucket1"]
+      Tags:
+        "billing-env" : !Ref EnvironmentParam
+        "billing-type" : "storage"
+        "Path" : "cloudformation/"
+        "StackName": !Sub '${AWS::StackName}'
+
+  CloudtrailLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentParam}-${AWS::StackName}-cloudtrail-log-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      AccessControl: Private
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+      Tags:
+        - 
+          Key: "billing-env"
+          Value: !Ref EnvironmentParam
+        -  
+          Key: "billing-type"
+          Value: "storage"
+        - 
+          Key: "Path"
+          Value: "cloudformation/"
+        - 
+          Key: "StackName"
+          Value: !Sub '${AWS::StackName}'
+
+  CloudtrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudtrailLogBucket
+      PolicyDocument:
+        Statement:
+          - 
+            Sid: S3GetBucketAclPolicy
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: 
+              - s3:GetBucketAcl
+            Resource: !Sub '${CloudtrailLogBucket.Arn}'
+          - 
+            Sid: S3PutObjectPolicy
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: 
+              - s3:PutObject
+            Resource: !Sub '${CloudtrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  S3ObjectCloudTrail: 
+    DependsOn: CloudtrailLogBucketPolicy
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref CloudtrailLogBucket
+      IsLogging: TRUE
+      EventSelectors:
+        - IncludeManagementEvents: false
+          ReadWriteType: All
+          DataResources:
+          - Type: AWS::S3::Object
+            Values:
+            # Add all the buckets you want to update here
+            - !Join [ '', ['arn:aws:s3:::', !FindInMap [S3Buckets, !Ref EnvironmentParam, "Bucket1"], '/' ] ]
+      Tags:
+        - 
+          Key: "billing-env"
+          Value: !Ref EnvironmentParam
+        -  
+          Key: "billing-type"
+          Value: "storage"
+        - 
+          Key: "Path"
+          Value: "cloudformation/"
+        - 
+          Key: "StackName"
+          Value: !Sub '${AWS::StackName}'
